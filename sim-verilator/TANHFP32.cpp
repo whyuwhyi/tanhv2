@@ -65,15 +65,19 @@ void sim_exit() {
   delete contextp;
 }
 
+void compute_reference(float *vin, float *cpu_ref, float *gpu_ref, int n) {
+  for (int i = 0; i < n; i++) {
+    cpu_ref[i] = tanhf(vin[i]);
+  }
+
 #ifdef __USE_GPU_REF__
-float tanh_reference(float x) {
-  float result;
-  tanh_nvidia_batch(&x, &result, 1);
-  return result;
-}
+  tanh_nvidia_batch(vin, gpu_ref, n);
 #else
-float tanh_reference(float x) { return tanhf(x); }
+  for (int i = 0; i < n; i++) {
+    gpu_ref[i] = cpu_ref[i];
+  }
 #endif
+}
 
 uint64_t compute_ulp(float golden, float hardware) {
   union {
@@ -106,44 +110,14 @@ uint64_t compute_ulp(float golden, float hardware) {
     return (uint64_t)(h.u - g.u);
 }
 
-static void test_random_cases() {
-  const int N = 1000000;
-  int pass = 0, fail = 0;
-  double total_err = 0.0, max_err = 0.0;
-  uint64_t total_ulp = 0, max_ulp = 0;
-  float *vin = (float *)malloc(sizeof(float) * N);
-  float *golden = (float *)malloc(sizeof(float) * N);
-  float *vout = (float *)malloc(sizeof(float) * N);
-  int i;
-  for (i = 0; i < N; i++) {
-    float in = ((float)rand() / RAND_MAX) * 10.0 - 1.0;
-    vin[i] = in;
-  }
-
-#ifdef __USE_GPU_REF__
-  tanh_nvidia_batch(vin, golden, N);
-#else
-  for (i = 0; i < N; i++) {
-    golden[i] = tanh_reference(vin[i]);
-  }
-#endif
-
-  printf("=== Random TANH Tests ===\n");
-#ifdef __USE_GPU_REF__
-  printf("Reference: NVIDIA GPU SFU\n");
-#else
-  printf("Reference: CPU tanhf\n");
-#endif
-  printf("%13s %13s %13s %13s %13s\n", "Input", "Golden", "Hardware", "Error",
-         "ULP");
-  printf("---------------------------------------------------------------------"
-         "----\n");
+void drive_dut(float *vin, float *vout, int n) {
   int issued = 0;
   int received = 0;
   top->io_out_ready = 1;
   top->io_in_valid = 0;
-  while (received < N) {
-    if (issued < N && top->io_in_ready) {
+
+  while (received < n) {
+    if (issued < n && top->io_in_ready) {
       union {
         float f;
         uint32_t u;
@@ -164,59 +138,127 @@ static void test_random_cases() {
       } out;
       out.u = top->io_out_bits_out;
       vout[received] = out.f;
-      {
-        double g = (double)golden[received];
-        double h = (double)vout[received];
-        double err;
-        uint64_t ulp = compute_ulp(golden[received], vout[received]);
-
-        if (std::isnan(g) && std::isnan(h)) {
-          err = 0.0;
-          pass++;
-        } else if (std::isinf(g) && std::isinf(h)) {
-          err = 0.0;
-          pass++;
-        } else {
-          err = fabs((h - g) / ((g == 0.0 || h == 0.0) ? 1.0 : g));
-          if (err < 1e-4 && ulp <= 2)
-            pass++;
-          else {
-            fail++;
-            printf("%+13.6e %+13.6e %+13.6e %13.6e %13llu\n", vin[received],
-                   golden[received], vout[received], err, ulp);
-          }
-        }
-        total_err += err;
-        total_ulp += ulp;
-        if (err > max_err)
-          max_err = err;
-        if (ulp > max_ulp)
-          max_ulp = ulp;
-      }
       received++;
     }
   }
-  printf("\nTotal=%d, Pass=%d (%.2f%%), Fail=%d (%.2f%%)\n", N, pass,
-         (pass * 100.0 / N), fail, (fail * 100.0 / N));
-  printf("AvgErr=%e, MaxErr=%e\n", total_err / N, max_err);
-  printf("AvgULP=%.2f, MaxULP=%llu\n", (double)total_ulp / N, max_ulp);
-  printf("Total cycles: %llu\n", cycle_count);
+}
+
+void save_data_to_csv(const char *filename, float *vin, float *dut,
+                      float *cpu_ref, float *gpu_ref, int n) {
+  printf("Saving data to %s...\n", filename);
+  FILE *fp = fopen(filename, "w");
+  if (!fp) {
+    printf("Warning: Failed to save data file.\n");
+    return;
+  }
+
+  fprintf(fp, "in,dut,cpu_ref");
+#ifdef __USE_GPU_REF__
+  fprintf(fp, ",gpu_ref");
+#endif
+  fprintf(fp, "\n");
+
+  for (int i = 0; i < n; i++) {
+    fprintf(fp, "%.9e,%.9e,%.9e", vin[i], dut[i], cpu_ref[i]);
+#ifdef __USE_GPU_REF__
+    fprintf(fp, ",%.9e", gpu_ref[i]);
+#endif
+    fprintf(fp, "\n");
+  }
+
+  fclose(fp);
+  printf("Data saved successfully.\n");
+}
+
+void compute_error_stats(float *vin, float *dut, float *ref, int n,
+                         double err_threshold, uint64_t ulp_threshold,
+                         bool print_failures, const char *ref_name) {
+  int pass = 0, fail = 0;
+  double total_err = 0.0, max_err = 0.0;
+  uint64_t total_ulp = 0, max_ulp = 0;
+
+  if (print_failures) {
+    printf("\n%13s %13s %13s %13s %13s\n", "Input", "Reference", "DUT", "Error",
+           "ULP");
+    printf(
+        "---------------------------------------------------------------------"
+        "----\n");
+  }
+
+  for (int i = 0; i < n; i++) {
+    double g = (double)ref[i];
+    double h = (double)dut[i];
+    double err;
+    uint64_t ulp = compute_ulp(ref[i], dut[i]);
+
+    if (std::isnan(g) && std::isnan(h)) {
+      err = 0.0;
+    } else if (std::isinf(g) && std::isinf(h)) {
+      err = 0.0;
+    } else {
+      err = fabs((h - g) / ((g == 0.0 || h == 0.0) ? 1.0 : g));
+    }
+
+    total_err += err;
+    total_ulp += ulp;
+    if (err > max_err)
+      max_err = err;
+    if (ulp > max_ulp)
+      max_ulp = ulp;
+
+    if ((std::isnan(g) && std::isnan(h)) || (std::isinf(g) && std::isinf(h))) {
+      pass++;
+    } else if (err < err_threshold && ulp <= ulp_threshold) {
+      pass++;
+    } else {
+      fail++;
+      if (print_failures) {
+        printf("%+13.6e %+13.6e %+13.6e %13.6e %13lu\n", vin[i], ref[i], dut[i],
+               err, ulp);
+      }
+    }
+  }
+
+  printf("\n=== %s Statistics ===\n", ref_name);
+  printf("Total=%d, Pass=%d (%.2f%%), Fail=%d (%.2f%%)\n", n, pass,
+         (pass * 100.0 / n), fail, (fail * 100.0 / n));
+  printf("AvgErr=%e, MaxErr=%e\n", total_err / n, max_err);
+  printf("AvgULP=%.2f, MaxULP=%lu\n", (double)total_ulp / n, max_ulp);
+}
+
+static void test_random_cases() {
+  const int N = 1000000;
+  float *vin = (float *)malloc(sizeof(float) * N);
+  float *cpu_ref = (float *)malloc(sizeof(float) * N);
+  float *gpu_ref = (float *)malloc(sizeof(float) * N);
+  float *dut = (float *)malloc(sizeof(float) * N);
+
+  for (int i = 0; i < N; i++) {
+    float in = ((float)rand() / RAND_MAX) * 10.0 - 1.0;
+    vin[i] = in;
+  }
+
+  printf("=== Random TANH Tests ===\n");
+  printf("Computing reference values...\n");
+  compute_reference(vin, cpu_ref, gpu_ref, N);
+
+  printf("Driving DUT...\n");
+  drive_dut(vin, dut, N);
+
+  compute_error_stats(vin, dut, cpu_ref, N, 1e-4, 2, true, "CPU_Ref");
+#ifdef __USE_GPU_REF__
+  compute_error_stats(vin, dut, gpu_ref, N, 1e-4, 2, true, "GPU_Ref");
+#endif
+
+  save_data_to_csv("build/random_cases.csv", vin, dut, cpu_ref, gpu_ref, N);
+
   free(vin);
-  free(golden);
-  free(vout);
+  free(cpu_ref);
+  free(gpu_ref);
+  free(dut);
 }
 
 static void test_special_cases() {
-  printf("\n=== Special TANH Tests (Extended) ===\n");
-#ifdef __USE_GPU_REF__
-  printf("Reference: NVIDIA GPU SFU\n");
-#else
-  printf("Reference: CPU tanhf\n");
-#endif
-  printf("%13s %13s %13s %13s %13s\n", "Input", "Golden", "Hardware", "Error",
-         "ULP");
-  printf("---------------------------------------------------------------------"
-         "----\n");
   const int N = 43;
   float vin[N] = {
       0.0f,          -0.0f,          1.0f,        -1.0f,        10.0f,
@@ -228,92 +270,35 @@ static void test_special_cases() {
       (float)-M_PI,  (float)M_E,     (float)-M_E, (float)M_LN2, (float)-M_LN2,
       (float)M_LN10, (float)-M_LN10, 88.0f,       89.0f,        90.0f,
       -87.0f,        -88.0f,         -89.0f};
-  float golden[N];
-  float vout[N];
+  float cpu_ref[N];
+  float gpu_ref[N];
+  float dut[N];
 
+  printf("\n=== Special TANH Tests ===\n");
+  printf("Computing reference values...\n");
+  compute_reference(vin, cpu_ref, gpu_ref, N);
+
+  printf("Driving DUT...\n");
+  drive_dut(vin, dut, N);
+
+  compute_error_stats(vin, dut, cpu_ref, N, 1e-4, 2, true, "CPU_Ref");
 #ifdef __USE_GPU_REF__
-  tanh_nvidia_batch(vin, golden, N);
-#else
-  for (int i = 0; i < N; i++) {
-    golden[i] = tanh_reference(vin[i]);
-  }
+  compute_error_stats(vin, dut, gpu_ref, N, 1e-4, 2, true, "GPU_Ref");
 #endif
-
-  int issued = 0, received = 0;
-  int pass = 0, fail = 0;
-  double total_err = 0.0, max_err = 0.0;
-  uint64_t total_ulp = 0, max_ulp = 0;
-  top->io_out_ready = 1;
-  top->io_in_valid = 0;
-  while (received < N) {
-    if (issued < N && top->io_in_ready) {
-      union {
-        float f;
-        uint32_t u;
-      } conv;
-      conv.f = vin[issued];
-      top->io_in_valid = 1;
-      top->io_in_bits_in = conv.u;
-      top->io_in_bits_rm = 0;
-      issued++;
-    } else {
-      top->io_in_valid = 0;
-    }
-    single_cycle();
-    if (top->io_out_valid) {
-      union {
-        float f;
-        uint32_t u;
-      } out;
-      out.u = top->io_out_bits_out;
-      vout[received] = out.f;
-      double g = (double)golden[received];
-      double h = (double)vout[received];
-      double err;
-      uint64_t ulp = compute_ulp(golden[received], vout[received]);
-
-      if (std::isnan(g) && std::isnan(h)) {
-        err = 0.0;
-        pass++;
-      } else if (std::isinf(g) && std::isinf(h)) {
-        err = 0.0;
-        pass++;
-      } else {
-        err = fabs((h - g) / ((g == 0.0 || h == 0.0) ? 1.0 : g));
-        if (err < 1e-4 && ulp <= 2)
-          pass++;
-        else
-          fail++;
-      }
-      total_err += err;
-      total_ulp += ulp;
-      if (err > max_err)
-        max_err = err;
-      if (ulp > max_ulp)
-        max_ulp = ulp;
-      printf("%+13.6e %+13.6e %+13.6e %13.6e %13llu\n", vin[received],
-             golden[received], vout[received], err, ulp);
-      received++;
-    }
-  }
-  printf("\nTotal=%d, Pass=%d (%.2f%%), Fail=%d (%.2f%%)\n", N, pass,
-         (pass * 100.0 / N), fail, (fail * 100.0 / N));
-  printf("AvgErr=%e, MaxErr=%e\n", total_err / N, max_err);
-  printf("AvgULP=%.2f, MaxULP=%llu\n", (double)total_ulp / N, max_ulp);
-  printf("Total cycles: %llu\n", cycle_count);
 }
 
 int main() {
   printf("Initializing TANH simulation...\n");
+  printf("References: CPU tanhf");
 #ifdef __USE_GPU_REF__
-  printf("Using NVIDIA GPU SFU as reference\n\n");
-#else
-  printf("Using CPU tanhf as reference\n\n");
+  printf(" + NVIDIA GPU SFU");
 #endif
+  printf("\n\n");
   sim_init();
   srand(time(NULL));
   test_special_cases();
   test_random_cases();
+  printf("Total cycles: %lu\n", cycle_count);
   printf("\nSimulation complete.\n");
   sim_exit();
   return 0;

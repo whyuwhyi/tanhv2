@@ -1,5 +1,3 @@
-USE_GPU_REF ?= 0
-
 VERILATOR = verilator
 NVCC      = nvcc
 
@@ -18,7 +16,10 @@ SCALA_SRC = src/scala/$(TOPNAME).scala
 
 CUDA_OBJ  = $(BUILD_DIR)/$(TOPNAME)_cuda.o
 
-ifeq ($(USE_GPU_REF), 1)
+# Auto-detect CUDA availability
+CUDA_AVAILABLE := $(shell which nvcc > /dev/null 2>&1 && echo 1 || echo 0)
+
+ifeq ($(CUDA_AVAILABLE), 1)
 	CUDA_PATH ?= /opt/cuda
 	CXXFLAGS = -D__USE_GPU_REF__
 	LDFLAGS = -L$(CUDA_PATH)/lib64 -lcudart $(abspath $(CUDA_OBJ))
@@ -37,7 +38,7 @@ $(CUDA_OBJ): $(CUDA_SRC)
 
 $(TARGET): $(VSRC) $(CSRC)
 	@mkdir -p $(OBJ_DIR)
-ifeq ($(USE_GPU_REF), 1)
+ifeq ($(CUDA_AVAILABLE), 1)
 	@$(MAKE) $(CUDA_OBJ)
 endif
 	$(VERILATOR) $(VERILATOR_FLAGS) $(VSRC) $(CSRC) -Mdir $(OBJ_DIR) --exe -o $(abspath $(TARGET))
